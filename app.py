@@ -23,6 +23,7 @@ with st.sidebar:
     risk_pct=st.slider("Risk per trade (%)",0.05,1.0,0.25,0.05)
     daily_limit=st.slider("Daily loss limit (%)",0.25,5.0,1.0,0.25)
     consecutive=st.number_input("Consecutive losses today",0,10,0)
+    daily_loss_amount=st.number_input("Realized daily loss (USDT)",min_value=0.0,value=0.0,step=1.0)
     spread_limit=st.slider("Max spread (%)",0.01,1.0,0.15,0.01)
     fee=st.number_input("Estimated fee per side (%)",0.0,1.0,0.05,0.01)
     slip=st.number_input("Estimated slippage per side (%)",0.0,1.0,0.03,0.01)
@@ -38,41 +39,47 @@ if scan:
         client=CoinDCXPublic()
         try:
             instruments=client.active_instruments(); prices=client.current_prices()
-            active_pairs={}
-            for inst in instruments:
-                if isinstance(inst,str): pair=inst
-                elif isinstance(inst,dict): pair=inst.get("pair") or inst.get("instrument") or inst.get("symbol")
-                else: pair=None
-                if pair: active_pairs[pair]=pair
             price_map=prices.get("prices",{})
-            # Map candidate base tickers to matching futures instrument names.
-            chosen={}
-            for ticker in CANDIDATES:
-                candidates=[p for p in active_pairs if ticker in p.upper() and "USDT" in p.upper()]
-                candidates=[p for p in candidates if p in price_map]
-                if candidates: chosen[ticker]=candidates[0]
+            chosen=client.map_candidates(instruments, CANDIDATES, price_map)
             st.session_state.active_universe=chosen
+            missing=[ticker for ticker in CANDIDATES if ticker not in chosen]
+            for ticker in missing:
+                results.append({"coin":ticker,"pair":"UNMAPPED","decision":"NO TRADE","status":"DATA ERROR",
+                               "reason":"No exact active USDT futures contract with a price-feed entry was found.",
+                               "conditions":{},"metrics":{},"trade_plan":None,"quality_score":0,"market_regime":"UNKNOWN",
+                               "price":None,"source":"CoinDCX public futures data","data_timestamp":"Unavailable"})
             for i,(ticker,pair) in enumerate(chosen.items()):
                 try:
                     pinfo=price_map.get(pair,{})
                     last=float(pinfo.get("ls") or pinfo.get("mp") or 0)
+                    tick_ts=pinfo.get("btST") or pinfo.get("cmRT") or prices.get("ts")
+                    stale=client.tick_is_stale(tick_ts)
                     candles=client.candles_15m(pair,lookback_minutes=3000)
                     h1=client.candles_1h(pair,lookback_minutes=6000)
-                    # Current price feed timestamp; stale check uses documented tick timestamp when present.
-                    tick_ts=pinfo.get("btST") or pinfo.get("cmRT") or prices.get("ts")
-                    stale=(tick_ts is not None and (time.time()*1000-float(tick_ts))>120000) or last<=0
-                    decision=analyze(pair,candles,h1,last,settings,equity=equity,spread_pct=None,stale=stale)
-                    decision["coin"]=ticker; decision["price"]=last; decision["source"]="CoinDCX public futures data"; decision["data_timestamp"]=str(candles.index[-1]) if len(candles) else "Unavailable"
+                    book=client.orderbook(pair,depth=20)
+                    candle_stale=(len(candles)==0 or (pd.Timestamp.now(tz="UTC")-candles.index[-1]).total_seconds()>1800)
+                    stale=stale or candle_stale
+                    decision=analyze(pair,candles,h1,last,settings,equity=equity,daily_loss=daily_loss_amount,consecutive_losses=consecutive,spread_pct=book.get("spread_pct"),stale=stale,orderbook=book)
+                    decision.update(coin=ticker,price=last,source="CoinDCX public futures data",data_timestamp=str(candles.index[-1]) if len(candles) else "Unavailable",orderbook=book)
                     results.append(decision)
-                except Exception as e: errors.append(f"{ticker} ({pair}): {e}")
+                except Exception as e:
+                    results.append({"coin":ticker,"pair":pair,"decision":"NO TRADE","status":"DATA ERROR","reason":str(e),
+                                   "conditions":{},"metrics":{},"trade_plan":None,"quality_score":0,"market_regime":"UNKNOWN",
+                                   "price":None,"source":"CoinDCX public futures data","data_timestamp":"Unavailable"})
+                    errors.append(f"{ticker} ({pair}): {e}")
                 progress.progress((i+1)/max(1,len(chosen)))
-            if not chosen: errors.append("No candidate futures instruments could be mapped to the active-instruments response.")
-        except Exception as e: errors.append(f"CoinDCX API error: {e}")
+            if not chosen: errors.append("No exact candidate futures contracts could be mapped to active CoinDCX instruments.")
+        except Exception as e:
+            errors.append(f"CoinDCX API error: {e}")
+            results=[{"coin":ticker,"pair":"UNAVAILABLE","decision":"NO TRADE","status":"DATA ERROR","reason":str(e),"conditions":{},"metrics":{},"trade_plan":None,"quality_score":0,"market_regime":"UNKNOWN","price":None,"source":"CoinDCX public futures data","data_timestamp":"Unavailable"} for ticker in CANDIDATES]
     else:
         for i,ticker in enumerate(CANDIDATES):
             df=demo_candles(seed=10+i)
-            result=analyze(ticker+"_USDT",df,df.resample("1h").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna(),float(df.close.iloc[-1]),settings,equity=equity)
-            result.update(coin=ticker,price=float(df.close.iloc[-1]),source="SYNTHETIC DEMO DATA",data_timestamp=str(df.index[-1]))
+            h1=df.resample("1h").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
+            demo_spread=0.04
+            demo_book={"best_bid":float(df.close.iloc[-1])*(1-demo_spread/200),"best_ask":float(df.close.iloc[-1])*(1+demo_spread/200),"spread_pct":demo_spread,"bid_depth":1000,"ask_depth":1000,"timestamp_ms":int(time.time()*1000)}
+            result=analyze(ticker+"_USDT",df,h1,float(df.close.iloc[-1]),settings,equity=equity,daily_loss=daily_loss_amount,consecutive_losses=consecutive,spread_pct=demo_spread,orderbook=demo_book)
+            result.update(coin=ticker,price=float(df.close.iloc[-1]),source="SYNTHETIC DEMO DATA",data_timestamp=str(df.index[-1]),orderbook=demo_book)
             results.append(result); progress.progress((i+1)/len(CANDIDATES))
     st.session_state.results=results; st.session_state.errors=errors; st.session_state.scan_time=time.strftime("%Y-%m-%d %H:%M:%S UTC",time.gmtime())
 
@@ -83,8 +90,9 @@ if results:
     counts={s:sum(r.get("decision")==s for r in results) for s in ["LONG","SHORT","WAIT","NO TRADE"]}
     c=st.columns(5)
     c[0].metric("Markets evaluated",len(results)); c[1].metric("LONG",counts["LONG"]); c[2].metric("SHORT",counts["SHORT"]); c[3].metric("WAIT",counts["WAIT"]); c[4].metric("NO TRADE",counts["NO TRADE"])
-    st.caption(f"Last scan: {scan_time} · News data: **NEWS DATA UNAVAILABLE** · Data mode: {results[0].get('source','unknown')}")
-    df=pd.DataFrame([{ "Coin":r.get("coin"),"Pair":r.get("pair"),"Decision":r.get("decision"),"Price":r.get("price"),"RSI":r.get("metrics",{}).get("rsi"),"ADX":r.get("metrics",{}).get("adx"),"Quality (not win probability)":r.get("quality_score"),"Reason":r.get("reason")} for r in results])
+    data_errors=sum(r.get("status")=="DATA ERROR" for r in results)
+    st.caption(f"Last scan: {scan_time} · Data errors: {data_errors} · News data: **NEWS DATA UNAVAILABLE** · Data mode: {results[0].get('source','unknown')}")
+    df=pd.DataFrame([{ "Coin":r.get("coin"),"Pair":r.get("pair"),"Status":r.get("status","OK"),"Decision":r.get("decision"),"Price":r.get("price"),"Spread %":r.get("spread_pct"),"RSI":r.get("metrics",{}).get("rsi"),"ADX":r.get("metrics",{}).get("adx"),"Regime":r.get("market_regime"),"Quality (not win probability)":r.get("quality_score"),"Reason":r.get("reason")} for r in results])
     st.subheader("Market Scanner")
     st.dataframe(df,use_container_width=True,hide_index=True)
     qualified=[r for r in results if r.get("decision") in ["LONG","SHORT"]]
@@ -100,7 +108,7 @@ if results:
     st.subheader("Market Details")
     for r in results:
         with st.expander(f"{r.get('coin')} · {r.get('decision')} · {r.get('pair')}"):
-            st.write(r.get("reason")); st.json(r.get("conditions",{})); st.json(r.get("metrics",{}));
+            st.write(r.get("reason")); st.write("**Status:**",r.get("status","OK")); st.write("**Condition checks:**"); st.json(r.get("conditions",{})); st.write("**Metrics:**"); st.json(r.get("metrics",{})); st.write("**Warnings:**",r.get("warnings",[])); st.write("**Orderbook:**",r.get("orderbook",{}));
             if r.get("trade_plan"): st.json(r["trade_plan"])
     st.download_button("Export scan CSV",df.to_csv(index=False),"202650_scan.csv","text/csv")
 if errors:
@@ -141,7 +149,7 @@ with tabs[6]:
     st.markdown("### Settings & API status")
     st.write("Public market data only; no API credentials are requested or stored.")
     st.write("CoinDCX public docs: active futures instruments, current prices, and futures candlesticks endpoints are used. API schema/rate availability can change.")
-    st.markdown("**Known limitations:** no private account balances, authenticated execution, news/event integration, funding-cost data, reliable order-book liquidity filters, precise spread calculation, contract-precision sizing, or automated BTC-correlation protection in this build.")
+    st.markdown("**Known limitations:** no private account balances, authenticated execution, news/event integration, funding-cost data, contract-precision sizing, or automated BTC-correlation protection in this build.")
     st.markdown("**News status:** NEWS DATA UNAVAILABLE")
 
 st.caption("202650 · Accuracy over activity · No signal is a valid result · This tool is educational and informational, not financial advice.")

@@ -95,3 +95,13 @@ Never fabricate data/signals; never force trades; never ignore failed rules or r
 **Not implemented:** production-grade backtesting, paper-trade simulator, persistent trade history, news/event feed, account balance integration, authenticated order execution, full API health/rate-limit/backoff/cache strategy, portfolio tracking, real exchange order verification.
 
 **Tested here:** Python compilation and 3 offline unit tests. No live CoinDCX API test, Streamlit deployment test, or trading profitability test was performed. See README.
+
+## V2 implementation notes (2026-11-23)
+- Exact base-symbol matching is used for candidate markets; ticker substring matches are rejected.
+- Public futures orderbook is used to estimate bid/ask spread. Signal approval is blocked when spread cannot be measured or exceeds the configured threshold.
+- OHLCV values are validated; complete 15-minute aggregates require three 5-minute bars; gaps in the candle series are rejected.
+- Ticker and completed-candle freshness checks are applied.
+- Scanner results distinguish `DATA ERROR` status from strategy `NO TRADE` decisions.
+- Daily realized loss and consecutive-loss input values are passed to the deterministic risk gate.
+- Indicator RSI edge cases are covered by tests.
+- The app remains analysis-only; backtesting, persistent paper trading, order execution, funding-aware sizing, contract precision and other future features remain unimplemented.
