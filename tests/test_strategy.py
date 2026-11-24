@@ -53,3 +53,16 @@ def test_missing_spread_blocks_signal():
     result=analyze("B-BTC_USDT",df,df,100,Settings(),spread_pct=None)
     assert result["decision"] == "NO TRADE"
     assert "Spread data unavailable" in result["reason"]
+
+
+def test_timestamp_unit_normalization():
+    import time
+    now = time.time()
+    seconds = now
+    milliseconds = now * 1000
+    microseconds = now * 1_000_000
+    nanoseconds = now * 1_000_000_000
+    for value in [seconds, milliseconds, microseconds, nanoseconds]:
+        assert not CoinDCXPublic.tick_is_stale(value)
+    assert CoinDCXPublic.tick_is_stale(None)
+    assert CoinDCXPublic.tick_is_stale("not-a-timestamp")

@@ -15,8 +15,17 @@ def analyze(pair: str, df15: pd.DataFrame, df1h: pd.DataFrame | None, price: flo
     if data_error:
         result.update(status="DATA ERROR", reason=data_error)
         return result
-    if stale or df15 is None or len(df15) < 50 or not math.isfinite(price) or price <= 0:
-        result.update(status="DATA ERROR", reason="Market data is stale, missing, or insufficient for indicator warm-up.")
+    if stale:
+        result.update(status="DATA ERROR", reason="Market ticker or completed-candle data failed the freshness check.")
+        return result
+    if df15 is None:
+        result.update(status="DATA ERROR", reason="15-minute candle data is missing.")
+        return result
+    if len(df15) < 50:
+        result.update(status="DATA ERROR", reason=f"Only {len(df15)} completed 15-minute candles received; at least 50 are required for indicator warm-up.")
+        return result
+    if not math.isfinite(price) or price <= 0:
+        result.update(status="DATA ERROR", reason=f"Current market price is missing or invalid: {price!r}.")
         return result
     try:
         x = indicators(df15)
@@ -27,11 +36,11 @@ def analyze(pair: str, df15: pd.DataFrame, df1h: pd.DataFrame | None, price: flo
     c = x.iloc[-1]
     if any(pd.isna(c[k]) for k in required) or not math.isfinite(float(c.atr)) or c.atr <= 0:
         result.update(status="DATA ERROR", reason="Latest completed candle has missing or invalid indicator values.")
-        return
+        return result
     previous = x.iloc[-3:-1]
     if len(previous) != 2:
         result.update(status="DATA ERROR", reason="Insufficient prior candles for excursion check.")
-        return
+        return result
     long_excursion = bool((previous.close < previous.bb_lower).any())
     short_excursion = bool((previous.close > previous.bb_upper).any())
     # Orderbook-derived spread is mandatory for signal approval; unavailable means no signal.

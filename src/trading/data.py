@@ -123,11 +123,43 @@ class CoinDCXPublic:
         return df
 
     @staticmethod
-    def tick_is_stale(timestamp_ms: Any, max_age_seconds: int = 120) -> bool:
-        if timestamp_ms is None:
-            return True
+    def timestamp_to_seconds(timestamp: Any) -> float | None:
+        """Normalize common Unix timestamp units (s, ms, us, ns) to seconds.
+
+        CoinDCX payload fields can differ in naming and unit. Magnitude-based
+        normalization avoids treating a valid millisecond timestamp as stale
+        or a nanosecond timestamp as a far-future value.
+        """
+        if timestamp is None:
+            return None
         try:
-            age = time.time() - float(timestamp_ms)/1000
-            return age < -30 or age > max_age_seconds
-        except (TypeError, ValueError):
+            # Accept ISO-8601 strings as well as numeric epoch values.
+            if isinstance(timestamp, str) and not timestamp.strip().replace(".", "", 1).isdigit():
+                parsed = pd.Timestamp(timestamp)
+                if parsed.tzinfo is None:
+                    parsed = parsed.tz_localize("UTC")
+                return float(parsed.timestamp())
+
+            value = float(timestamp)
+            if not pd.notna(value) or value <= 0:
+                return None
+            magnitude = abs(value)
+            if magnitude >= 1e17:       # nanoseconds
+                return value / 1_000_000_000
+            if magnitude >= 1e14:       # microseconds
+                return value / 1_000_000
+            if magnitude >= 1e11:       # milliseconds
+                return value / 1_000
+            if magnitude >= 1e9:        # seconds
+                return value
+            return None
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    @staticmethod
+    def tick_is_stale(timestamp: Any, max_age_seconds: int = 120) -> bool:
+        epoch_seconds = CoinDCXPublic.timestamp_to_seconds(timestamp)
+        if epoch_seconds is None:
             return True
+        age = time.time() - epoch_seconds
+        return age < -30 or age > max_age_seconds
